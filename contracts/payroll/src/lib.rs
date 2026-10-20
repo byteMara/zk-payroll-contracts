@@ -129,7 +129,8 @@ pub use payroll_variance::{
 /// Treasury balance reservation checks (#699).
 pub mod treasury_reservation;
 pub use treasury_reservation::{
-    check_reservation, unreserved_balance, ReservationIssue, ReservationOutcome,
+    check_reservation, check_reservation_with_buffer, reservable_balance, unreserved_balance,
+    ReservationIssue, ReservationOutcome,
 };
 
 /// Multi-batch execution progress tracking (#643).
@@ -1478,6 +1479,8 @@ pub enum DataKey {
     /// never stored on-chain, only its hash, so this key existing is what
     /// `register_memo_hash`'s duplicate guard checks for.
     MemoHash(Address, Symbol, BytesN<32>),
+    /// Minimum token balance retained in the treasury after payroll outflows.
+    TreasuryBalanceBuffer,
     // Future upgrade example (issue #196):
     // PayrollRunV2(u64),  // Would be added here when schema evolution is needed
 }
@@ -1615,13 +1618,15 @@ pub struct ComplianceEvidencePointer {
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl Payroll {
-    /// Refuse to lock more treasury funds than are unreserved (#699).
+    /// Refuse to lock more treasury funds than are reservable after the
+    /// configured retained balance buffer (#699/#712).
     ///
     /// `prepare_payroll_run` locks a run's total so withdrawals cannot spend
     /// it. The lock is only meaningful if the treasury can cover it, so this
     /// applies the rule `check_funding_source_readiness` uses for a
-    /// hypothetical spend (`amount <= treasury balance - locked funds`) to the
-    /// real reservation, and fails with the figures behind the decision.
+    /// hypothetical spend (`amount <= treasury balance - locked funds -
+    /// buffer`) to the real reservation, accounting for the configured buffer,
+    /// and fails with the figures behind the decision.
     fn require_reservable_treasury_balance(e: &Env, addrs: &ContractAddresses, amount: i128) {
         let total_balance =
             match soroban_token::Client::new(e, &addrs.token).try_balance(&addrs.treasury) {
@@ -1631,16 +1636,47 @@ impl Payroll {
                 ),
             };
         let reserved = Self::get_locked_funds(e.clone(), addrs.token.clone());
+        let buffer = Self::get_treasury_balance_buffer(e.clone());
 
-        match treasury_reservation::check_reservation(total_balance, reserved, amount) {
+        match treasury_reservation::check_reservation_with_buffer(
+            total_balance,
+            reserved,
+            buffer,
+            amount,
+        ) {
             Ok(_) => {}
             Err(ReservationIssue::NonPositiveAmount) => {
                 panic!("Reservation amount must be positive")
             }
             Err(ReservationIssue::InsufficientUnreserved { available }) => panic!(
-                "Insufficient available treasury balance: run needs {} but only {} is unreserved ({} of {} is locked for pending payroll); fund the treasury or cancel a pending run",
-                amount, available, reserved, total_balance
+                "Insufficient available treasury balance: run needs {} but only {} is reservable after the {} buffer ({} of {} is locked for pending payroll); fund the treasury, reduce the buffer, or cancel a pending run",
+                amount, available, buffer, reserved, total_balance
             ),
+        }
+    }
+
+    /// Refuse an outflow that would leave less than the configured treasury
+    /// buffer. The treasury is external, so every payout checks its live
+    /// balance immediately before transferring.
+    fn require_treasury_buffer_after_spend(e: &Env, addrs: &ContractAddresses, amount: i128) {
+        let total_balance =
+            match soroban_token::Client::new(e, &addrs.token).try_balance(&addrs.treasury) {
+                Ok(Ok(balance)) => balance,
+                _ => panic!("Treasury token unavailable: cannot confirm balance before payout"),
+            };
+        let buffer = Self::get_treasury_balance_buffer(e.clone());
+        if total_balance < amount {
+            panic!(
+                "Insufficient treasury balance: available {} but batch requires {}",
+                total_balance, amount
+            );
+        }
+        let remaining = total_balance - amount;
+        if remaining < buffer {
+            panic!(
+                "Treasury balance buffer would be breached: payout of {} leaves {}, below the configured buffer of {}",
+                amount, remaining, buffer
+            );
         }
     }
 
@@ -3886,7 +3922,9 @@ impl Payroll {
 
         let available = Self::get_available_treasury_balance(e.clone(), addrs.token.clone());
         if amount > available {
-            panic!("Insufficient available treasury balance: funds locked for pending payroll");
+            panic!(
+                "Insufficient available treasury balance: funds are locked for pending payroll or reserved by the treasury buffer"
+            );
         }
 
         let request = EmergencyWithdrawalRequest {
@@ -3927,7 +3965,9 @@ impl Payroll {
 
         let available = Self::get_available_treasury_balance(e.clone(), addrs.token.clone());
         if request.amount > available {
-            panic!("Insufficient available treasury balance: funds locked for pending payroll");
+            panic!(
+                "Insufficient available treasury balance: funds are locked for pending payroll or reserved by the treasury buffer"
+            );
         }
 
         // Clear before transfer (checks-effects-interactions).
@@ -4683,13 +4723,7 @@ impl Payroll {
 
         // Issue #62: fail early if the treasury token balance cannot cover the
         // full batch payout, before any proof verification or transfers begin.
-        let treasury_balance = token_client.balance(&addrs.treasury);
-        if treasury_balance < expected_total_spend {
-            panic!(
-                "Insufficient treasury balance: available {} but batch requires {}",
-                treasury_balance, expected_total_spend
-            );
-        }
+        Self::require_treasury_buffer_after_spend(&e, &addrs, expected_total_spend);
 
         let verifier = ProofVerifierClient::new(&e, &addrs.verifier);
         let commitment_client = SalaryCommitmentContractClient::new(&e, &addrs.commitment);
@@ -4901,13 +4935,7 @@ impl Payroll {
 
         let token_client = soroban_token::Client::new(&e, &addrs.token);
 
-        let treasury_balance = token_client.balance(&addrs.treasury);
-        if treasury_balance < expected_total_spend {
-            panic!(
-                "Insufficient treasury balance: available {} but batch requires {}",
-                treasury_balance, expected_total_spend
-            );
-        }
+        Self::require_treasury_buffer_after_spend(&e, &addrs, expected_total_spend);
 
         let verifier = ProofVerifierClient::new(&e, &addrs.verifier);
         let commitment_client = SalaryCommitmentContractClient::new(&e, &addrs.commitment);
@@ -5414,6 +5442,14 @@ impl Payroll {
         let token_client = soroban_token::Client::new(&e, &addrs.token);
         let verifier = ProofVerifierClient::new(&e, &addrs.verifier);
         let commitment_client = SalaryCommitmentContractClient::new(&e, &addrs.commitment);
+
+        let mut batch_spend = 0i128;
+        for i in start_index..end_index {
+            batch_spend = batch_spend
+                .checked_add(amounts.get(i).unwrap())
+                .expect("Batch spend overflow");
+        }
+        Self::require_treasury_buffer_after_spend(&e, &addrs, batch_spend);
 
         for i in start_index..end_index {
             let proof = proofs.get(i).unwrap();
@@ -6825,6 +6861,49 @@ impl Payroll {
             .unwrap_or(0i128)
     }
 
+    /// Set the minimum token balance that payroll outflows must retain.
+    ///
+    /// Only the admin may change the buffer, and no prepared payroll run may
+    /// be active while it changes. A zero buffer preserves the original
+    /// behavior.
+    pub fn set_treasury_balance_buffer(e: Env, admin: Address, minimum_balance: i128) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        Self::require_no_active_payroll_run(&e);
+        if minimum_balance < 0 {
+            panic!("Treasury balance buffer cannot be negative");
+        }
+
+        let previous_ref = stored_ref(&e, &DataKey::TreasuryBalanceBuffer);
+        e.storage()
+            .persistent()
+            .set(&DataKey::TreasuryBalanceBuffer, &minimum_balance);
+        record_config_change(
+            &e,
+            &admin,
+            config_keys::TREASURY_BALANCE_BUFFER,
+            no_value_ref(&e),
+            previous_ref,
+            stored_ref(&e, &DataKey::TreasuryBalanceBuffer),
+        );
+    }
+
+    /// Return the minimum treasury balance that payroll outflows must retain.
+    /// Returns zero until the admin configures a buffer.
+    pub fn get_treasury_balance_buffer(e: Env) -> i128 {
+        e.storage()
+            .persistent()
+            .get(&DataKey::TreasuryBalanceBuffer)
+            .unwrap_or(0)
+    }
+
     /// Get available unreserved treasury balance for an asset.
     pub fn get_available_treasury_balance(e: Env, asset: Address) -> i128 {
         if Self::validate_treasury_asset(e.clone(), asset.clone()).is_err() {
@@ -6837,7 +6916,11 @@ impl Payroll {
             .expect("Not initialized");
         let total_balance = soroban_token::Client::new(&e, &asset).balance(&addrs.treasury);
         let locked = Self::get_locked_funds(e.clone(), asset);
-        total_balance.checked_sub(locked).unwrap_or(0i128)
+        treasury_reservation::reservable_balance(
+            total_balance,
+            locked,
+            Self::get_treasury_balance_buffer(e),
+        )
     }
 
     pub fn add_locked_funds(e: &Env, asset: Address, amount: i128) {
@@ -9748,7 +9831,8 @@ impl Payroll {
     ///
     /// Returns the total balance held at the treasury address, the reserved/locked
     /// balance allocated to pending payroll runs, blocked balances, and the net
-    /// available balance without disclosing individual salary rows.
+    /// available balance after retaining the configured treasury buffer,
+    /// without disclosing individual salary rows.
     pub fn get_safe_treasury_summary(e: Env, asset: Address) -> SafeTreasurySummary {
         Self::require_active_treasury_asset(&e, asset.clone());
         let addrs: ContractAddresses = e
@@ -9759,11 +9843,11 @@ impl Payroll {
         let total_balance = soroban_token::Client::new(&e, &asset).balance(&addrs.treasury);
         let reserved_balance = Self::get_locked_funds(e.clone(), asset.clone());
         let blocked_balance = 0i128;
-        let available_balance = total_balance
-            .checked_sub(reserved_balance)
-            .unwrap_or(0i128)
-            .checked_sub(blocked_balance)
-            .unwrap_or(0i128);
+        let available_balance = treasury_reservation::reservable_balance(
+            total_balance,
+            reserved_balance.saturating_add(blocked_balance),
+            Self::get_treasury_balance_buffer(e),
+        );
 
         SafeTreasurySummary {
             asset,
@@ -9779,8 +9863,9 @@ impl Payroll {
     ///
     /// Readiness requires a positive `required_amount`, an initialized and
     /// allowlisted canonical token, a responding SEP-41 balance query, and
-    /// enough unreserved treasury balance. The returned blocker gives SDKs an
-    /// actionable reason when any prerequisite is missing.
+    /// enough treasury balance after pending locks and the configured buffer.
+    /// The returned blocker gives SDKs an actionable reason when any
+    /// prerequisite is missing.
     pub fn check_funding_source_readiness(
         e: Env,
         required_amount: i128,
@@ -9813,8 +9898,12 @@ impl Payroll {
             Ok(Ok(balance)) => balance,
             _ => return blocked(FundingSourceBlocker::TokenUnavailable, None),
         };
-        let reserved_balance = Self::get_locked_funds(e, addrs.token);
-        let available_balance = total_balance.saturating_sub(reserved_balance);
+        let reserved_balance = Self::get_locked_funds(e.clone(), addrs.token);
+        let available_balance = treasury_reservation::reservable_balance(
+            total_balance,
+            reserved_balance,
+            Self::get_treasury_balance_buffer(e.clone()),
+        );
 
         if available_balance < required_amount {
             return blocked(
@@ -14111,7 +14200,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "Insufficient available treasury balance: funds locked for pending payroll"
+        expected = "Insufficient available treasury balance: funds are locked for pending payroll or reserved by the treasury buffer"
     )]
     fn test_withdrawal_guardrails_rejects_underfunding() {
         let env = Env::default();

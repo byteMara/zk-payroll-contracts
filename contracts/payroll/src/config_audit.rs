@@ -51,6 +51,8 @@ pub mod config_keys {
     pub const COMPANY_STATE: &str = "company_state";
     /// `set_capacity_limits` — value: `CapacityLimits`.
     pub const CAPACITY_LIMITS: &str = "capacity_limits";
+    /// `set_treasury_balance_buffer` — value: minimum retained token balance.
+    pub const TREASURY_BALANCE_BUFFER: &str = "treasury_balance_buffer";
     /// `set_settlement_window` — subject: period; value: `SettlementWindow`.
     pub const SETTLEMENT_WINDOW: &str = "settlement_window";
     /// `freeze_period_config` — subject: period; value: `bool`.

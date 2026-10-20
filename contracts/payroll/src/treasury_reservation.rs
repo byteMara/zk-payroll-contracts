@@ -15,10 +15,9 @@
 //! tested without a Soroban host.
 //!
 //! The rule is the same one [`crate::Payroll::check_funding_source_readiness`]
-//! already applies to a hypothetical spend: the amount must fit in
-//! `total_balance - reserved`. Reserving now uses that rule too, so a
-//! readiness check that says "ready" and a `prepare_payroll_run` that follows
-//! it cannot disagree.
+//! applies to a hypothetical spend: the amount must fit in the balance after
+//! existing locks and the configured buffer. Reserving uses that rule too, so
+//! readiness and `prepare_payroll_run` cannot disagree.
 //!
 //! Privacy: only aggregate token amounts are read. No employee identity,
 //! salary row, or proof material is involved.
@@ -28,10 +27,10 @@
 pub enum ReservationIssue {
     /// The amount to reserve is zero or negative.
     NonPositiveAmount,
-    /// The treasury's unreserved balance is smaller than the amount.
+    /// The balance available after existing locks and the buffer is smaller
+    /// than the amount.
     ///
-    /// `available` is what could still be reserved, never negative: a
-    /// treasury that holds less than is already locked reports `0`.
+    /// `available` is what could still be reserved, never negative.
     InsufficientUnreserved { available: i128 },
 }
 
@@ -48,11 +47,11 @@ impl ReservationIssue {
 /// What the treasury looks like once a reservation is accepted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReservationOutcome {
-    /// Unreserved balance before this reservation.
+    /// Balance available to reserve after existing locks and the buffer.
     pub available_before: i128,
     /// Total locked funds after this reservation.
     pub reserved_after: i128,
-    /// Unreserved balance left after this reservation.
+    /// Reservable balance left after this reservation.
     pub available_after: i128,
 }
 
@@ -74,19 +73,40 @@ pub fn check_reservation(
     reserved: i128,
     amount: i128,
 ) -> Result<ReservationOutcome, ReservationIssue> {
+    check_reservation_with_buffer(total_balance, reserved, 0, amount)
+}
+
+/// Balance available for a new reservation after locks and a retained buffer.
+/// Negative values are treated as zero so an invalid input cannot increase
+/// available funds.
+pub fn reservable_balance(total_balance: i128, reserved: i128, buffer: i128) -> i128 {
+    total_balance
+        .saturating_sub(reserved.max(0))
+        .saturating_sub(buffer.max(0))
+        .max(0)
+}
+
+/// Decide whether `amount` may be reserved while keeping `buffer` in the
+/// treasury after accounting for existing reservations.
+pub fn check_reservation_with_buffer(
+    total_balance: i128,
+    reserved: i128,
+    buffer: i128,
+    amount: i128,
+) -> Result<ReservationOutcome, ReservationIssue> {
     if amount <= 0 {
         return Err(ReservationIssue::NonPositiveAmount);
     }
 
-    let available_before = unreserved_balance(total_balance, reserved);
+    let available_before = reservable_balance(total_balance, reserved, buffer);
     if available_before < amount {
         return Err(ReservationIssue::InsufficientUnreserved {
             available: available_before,
         });
     }
 
-    // `amount <= available_before <= total_balance - reserved`, so this sum is
-    // at most `total_balance` and cannot overflow.
+    // `amount <= available_before <= total_balance - reserved - buffer`, so
+    // this sum is at most `total_balance` and cannot overflow.
     let reserved_after = reserved.max(0) + amount;
 
     Ok(ReservationOutcome {

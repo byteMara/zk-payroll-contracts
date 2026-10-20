@@ -80,7 +80,7 @@ fn reserving_exactly_the_unreserved_balance_is_allowed() {
 
 #[test]
 #[should_panic(
-    expected = "Insufficient available treasury balance: run needs 1000001 but only 1000000 is unreserved (0 of 1000000 is locked for pending payroll)"
+    expected = "Insufficient available treasury balance: run needs 1000001 but only 1000000 is reservable after the 0 buffer (0 of 1000000 is locked for pending payroll)"
 )]
 fn one_unit_over_the_unreserved_balance_is_rejected_with_the_numbers() {
     let env = Env::default();
@@ -90,7 +90,7 @@ fn one_unit_over_the_unreserved_balance_is_rejected_with_the_numbers() {
 }
 
 #[test]
-#[should_panic(expected = "fund the treasury or cancel a pending run")]
+#[should_panic(expected = "fund the treasury, reduce the buffer, or cancel a pending run")]
 fn the_rejection_says_how_to_recover() {
     let env = Env::default();
     let (client, _token, _employee) = common::setup(&env);
@@ -119,7 +119,7 @@ fn reservations_accumulate_across_pending_runs() {
 
 #[test]
 #[should_panic(
-    expected = "run needs 400001 but only 400000 is unreserved (600000 of 1000000 is locked for pending payroll)"
+    expected = "run needs 400001 but only 400000 is reservable after the 0 buffer (600000 of 1000000 is locked for pending payroll)"
 )]
 fn the_rejection_names_the_funds_other_runs_already_lock() {
     let env = Env::default();
@@ -181,7 +181,7 @@ fn a_treasury_drawn_below_its_locked_funds_has_nothing_to_reserve() {
 
 #[test]
 #[should_panic(
-    expected = "run needs 1 but only 0 is unreserved (500000 of 300000 is locked for pending payroll)"
+    expected = "run needs 1 but only 0 is reservable after the 0 buffer (500000 of 300000 is locked for pending payroll)"
 )]
 fn the_rejection_reports_zero_available_never_a_negative_figure() {
     let env = Env::default();
