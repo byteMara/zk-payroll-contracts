@@ -328,7 +328,31 @@ pub fn emit_batch_checkpoint_resumed(
     );
 }
 
-/// Emitted when a completed or failed batch checkpoint is cleaned up.
+/// Emitted when the admin stops remaining work in a payroll batch.
+/// The processed cursor is retained for reconciliation.
+pub fn emit_batch_checkpoint_rolled_back(
+    e: &Env,
+    employer: Address,
+    batch_root: BytesN<32>,
+    asset: Address,
+    execution_nonce: BytesN<32>,
+    processed_count: u32,
+    total_count: u32,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "batch_checkpoint_rolled_back")),
+        (
+            employer,
+            batch_root,
+            asset,
+            execution_nonce,
+            processed_count,
+            total_count,
+        ),
+    );
+}
+
+/// Emitted when a terminal batch checkpoint is cleaned up.
 pub fn emit_batch_checkpoint_cleaned(
     e: &Env,
     employer: Address,

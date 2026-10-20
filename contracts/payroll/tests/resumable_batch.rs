@@ -306,6 +306,134 @@ fn resume_rejects_mid_execution_checkpoint() {
         .is_err());
 }
 
+#[test]
+fn admin_can_roll_back_remaining_batch_work() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let (employer, batch_root, asset, execution_nonce) = checkpoint_identity(&env);
+
+    client.begin_batch_execution_checkpoint(
+        &admin,
+        &employer,
+        &batch_root,
+        &asset,
+        &execution_nonce,
+        &0,
+    );
+    client.record_batch_checkpoint_progress(
+        &admin,
+        &employer,
+        &batch_root,
+        &asset,
+        &execution_nonce,
+        &2,
+        &BatchCheckpointState::PartiallyCheckpointed,
+    );
+
+    client.rollback_payroll_batch(&admin, &employer, &batch_root, &asset, &execution_nonce);
+
+    let checkpoint =
+        client.get_batch_execution_checkpoint(&employer, &batch_root, &asset, &execution_nonce);
+    assert_eq!(checkpoint.state, BatchCheckpointState::RolledBack);
+    assert_eq!(checkpoint.last_checkpoint_index, 2);
+    assert!(!checkpoint.completed);
+    assert!(!checkpoint.failed);
+
+    let plan =
+        client.get_batch_resume_plan(&employer, &batch_root, &asset, &execution_nonce, &5);
+    assert_eq!(plan.status, BatchResumeStatus::RolledBack);
+    assert_eq!(plan.processed_count, 2);
+    assert_eq!(plan.remaining_count, 3);
+    assert!(!plan.can_resume);
+
+    assert!(client
+        .try_resume_payroll_batch(
+            &admin,
+            &employer,
+            &batch_root,
+            &asset,
+            &execution_nonce,
+            &5,
+        )
+        .is_err());
+    assert!(client
+        .try_record_batch_checkpoint_progress(
+            &admin,
+            &employer,
+            &batch_root,
+            &asset,
+            &execution_nonce,
+            &3,
+            &BatchCheckpointState::PartiallyCheckpointed,
+        )
+        .is_err());
+
+    client.cleanup_batch_checkpoint(&admin, &employer, &batch_root, &asset, &execution_nonce);
+    let plan =
+        client.get_batch_resume_plan(&employer, &batch_root, &asset, &execution_nonce, &5);
+    assert_eq!(plan.status, BatchResumeStatus::NotFound);
+}
+
+#[test]
+fn non_admin_cannot_roll_back_batch() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let (employer, batch_root, asset, execution_nonce) = checkpoint_identity(&env);
+
+    client.begin_batch_execution_checkpoint(
+        &admin,
+        &employer,
+        &batch_root,
+        &asset,
+        &execution_nonce,
+        &0,
+    );
+
+    let outsider = Address::generate(&env);
+    assert!(client
+        .try_rollback_payroll_batch(
+            &outsider,
+            &employer,
+            &batch_root,
+            &asset,
+            &execution_nonce,
+        )
+        .is_err());
+
+    let checkpoint =
+        client.get_batch_execution_checkpoint(&employer, &batch_root, &asset, &execution_nonce);
+    assert_eq!(checkpoint.state, BatchCheckpointState::Started);
+}
+
+#[test]
+fn completed_batch_cannot_be_rolled_back() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let (employer, batch_root, asset, execution_nonce) = checkpoint_identity(&env);
+
+    client.begin_batch_execution_checkpoint(
+        &admin,
+        &employer,
+        &batch_root,
+        &asset,
+        &execution_nonce,
+        &0,
+    );
+    client.record_batch_checkpoint_progress(
+        &admin,
+        &employer,
+        &batch_root,
+        &asset,
+        &execution_nonce,
+        &3,
+        &BatchCheckpointState::Completed,
+    );
+
+    assert!(client
+        .try_rollback_payroll_batch(&admin, &employer, &batch_root, &asset, &execution_nonce)
+        .is_err());
+}
+
 // ── Plan edge cases ──────────────────────────────────────────────────────────
 
 #[test]

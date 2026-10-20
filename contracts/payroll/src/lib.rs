@@ -342,6 +342,7 @@ pub enum BatchCheckpointState {
     Resumed = 2,
     Completed = 3,
     Failed = 4,
+    RolledBack = 5,
 }
 
 /// A privacy-safe checkpoint for an interrupted payroll batch.
@@ -383,6 +384,8 @@ pub enum BatchResumeStatus {
     /// A checkpoint already finished (all payments executed). Resubmitting is
     /// rejected, so the caller can stop polling.
     Completed = 3,
+    /// The admin stopped the remaining work. Completed payments remain final.
+    RolledBack = 4,
 }
 
 /// Privacy-safe, actionable resume plan for an interrupted payroll batch
@@ -3195,10 +3198,13 @@ impl Payroll {
 
         if checkpoint.completed
             || checkpoint.failed
+            || checkpoint.state == BatchCheckpointState::RolledBack
             || checkpoint_index < checkpoint.last_checkpoint_index
             || matches!(
                 state,
-                BatchCheckpointState::Started | BatchCheckpointState::Resumed
+                BatchCheckpointState::Started
+                    | BatchCheckpointState::Resumed
+                    | BatchCheckpointState::RolledBack
             )
         {
             panic!("ERR_BATCH_CHECKPOINT_MISMATCH");
@@ -3390,7 +3396,9 @@ impl Payroll {
             0
         };
 
-        let status = if checkpoint.completed {
+        let status = if checkpoint.state == BatchCheckpointState::RolledBack {
+            BatchResumeStatus::RolledBack
+        } else if checkpoint.completed {
             BatchResumeStatus::Completed
         } else if checkpoint.failed {
             BatchResumeStatus::FailedRetryable
@@ -3538,6 +3546,7 @@ impl Payroll {
                 BatchCheckpointState::Resumed
                     | BatchCheckpointState::Completed
                     | BatchCheckpointState::Failed
+                    | BatchCheckpointState::RolledBack
             )
             || checkpoint.completed
             || checkpoint.failed
@@ -3560,7 +3569,68 @@ impl Payroll {
         true
     }
 
-    /// Clean up a completed or failed batch checkpoint.
+    /// Stop remaining work on an incomplete payroll batch without reversing
+    /// payouts that were already executed.
+    ///
+    /// The registered admin may roll back active or failed checkpoints. The
+    /// processed cursor is preserved for reconciliation, and the terminal
+    /// checkpoint prevents the same identity from being resumed or replayed.
+    /// Completed batches cannot be rolled back.
+    pub fn rollback_payroll_batch(
+        e: Env,
+        admin: Address,
+        employer: Address,
+        batch_root: BytesN<32>,
+        asset: Address,
+        execution_nonce: BytesN<32>,
+    ) {
+        Self::validate_non_zero_digest(&e, &batch_root, "batch_root");
+        Self::validate_non_zero_digest(&e, &execution_nonce, "execution_nonce");
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        let key = DataKey::BatchCheckpoint(
+            employer.clone(),
+            batch_root.clone(),
+            asset.clone(),
+            execution_nonce.clone(),
+        );
+        let mut checkpoint: BatchCheckpoint = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Batch execution checkpoint not found");
+
+        if checkpoint.completed {
+            panic!("Cannot roll back a completed payroll batch");
+        }
+        if checkpoint.state == BatchCheckpointState::RolledBack {
+            panic!("Payroll batch was already rolled back");
+        }
+
+        checkpoint.state = BatchCheckpointState::RolledBack;
+        checkpoint.failed = false;
+        e.storage().persistent().set(&key, &checkpoint);
+
+        payroll_events::emit_batch_checkpoint_rolled_back(
+            &e,
+            employer,
+            batch_root,
+            asset,
+            execution_nonce,
+            checkpoint.last_checkpoint_index,
+            checkpoint.total_checkpoints,
+        );
+    }
+
+    /// Clean up a completed, failed or rolled-back batch checkpoint.
     pub fn cleanup_batch_checkpoint(
         e: Env,
         admin: Address,
@@ -3593,7 +3663,10 @@ impl Payroll {
             .get(&key)
             .expect("Batch execution checkpoint not found");
 
-        if !checkpoint.completed && !checkpoint.failed {
+        if !checkpoint.completed
+            && !checkpoint.failed
+            && checkpoint.state != BatchCheckpointState::RolledBack
+        {
             panic!("Cannot cleanup active batch checkpoint");
         }
 
@@ -5333,6 +5406,9 @@ impl Payroll {
 
         let mut checkpoint: BatchCheckpoint = if e.storage().persistent().has(&checkpoint_key) {
             let mut cp: BatchCheckpoint = e.storage().persistent().get(&checkpoint_key).unwrap();
+            if cp.state == BatchCheckpointState::RolledBack {
+                panic!("Payroll batch was rolled back and cannot be resumed");
+            }
             if cp.completed {
                 panic!("Payroll batch already completed");
             }

@@ -124,6 +124,26 @@ and emitted. No per-employee salary, identity, commitment, or proof material
 is read or surfaced, consistent with the checkpoint (`BatchCheckpoint`) and
 resume-plan (`BatchResumePlan`) features.
 
+## Rolling back an imported batch
+
+`rollback_payroll_batch(admin, employer, batch_root, asset, execution_nonce)`
+lets the registered admin stop an incomplete or failed batch. The transition
+sets its checkpoint to `RolledBack` and preserves the processed cursor, so
+`get_batch_resume_plan` reports `RolledBack` and the bounded execution and
+resume entrypoints reject the same identity. A completed batch cannot be rolled
+back. Terminal rollback is auditable through the
+`batch_checkpoint_rolled_back` event and can be removed later with
+`cleanup_batch_checkpoint`.
+
+Rollback only stops unprocessed work. Payments already transferred in prior
+bounded calls are final and are not reversed; reconcile those payments
+separately before starting a corrected batch with a fresh identity.
+
+The rollback entrypoint rejects callers other than the registered admin,
+missing checkpoints, completed batches, and checkpoints already rolled back.
+Cleanup is optional and removes the terminal checkpoint, so only use it after
+the rollback has been recorded and reconciled.
+
 ## Verification
 
 - `cargo test -p payroll --test multi_batch_progress` — 12 focused
