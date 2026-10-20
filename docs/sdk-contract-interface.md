@@ -319,6 +319,12 @@ Drafts let you correct totals before committing on-chain.
 | `run_id` | `u64`                  | Completed run ID                          |
 | `status` | `ReconciliationStatus` | `Reconciled`, `Unreconciled`, or `Failed` |
 
+Accepted updates persist a run-scoped `ReconciliationMarker` with the status,
+ledger timestamp, and admin address. Read the latest marker with
+`Payroll::get_reconciliation_marker(run_id)`; it returns `None` until an
+explicit reconciliation status update is accepted. The marker contains no
+payroll amounts or employee records.
+
 #### Stale prepared runs: expiration (#474)
 
 A run prepared via `prepare_payroll_run` (or a two-step flow that leaves a run
